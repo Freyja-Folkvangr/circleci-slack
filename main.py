@@ -8,7 +8,9 @@ import json
 import argparse
 import logging
 from typing import Dict, List, Optional
-import requests
+import urllib.request
+import urllib.error
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,25 +163,30 @@ class SlackNotifier:
         return [header] + phase_attachments
 
     def _slack_request(self, method: str, payload: Dict) -> Dict:
-        """Make Slack API request"""
+        """Make Slack API request using urllib"""
         url = f"https://slack.com/api/chat.{method}"
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
-        }
+        data = json.dumps(payload).encode('utf-8')
+
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                'Authorization': f'Bearer {self.token}',
+                'Content-Type': 'application/json'
+            }
+        )
 
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
+            with urllib.request.urlopen(req, timeout=30) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
 
-            data = response.json()
-            if not data.get('ok'):
-                error_msg = data.get('error', 'Unknown error')
+            if not response_data.get('ok'):
+                error_msg = response_data.get('error', 'Unknown error')
                 raise Exception(f"Slack API error: {error_msg}")
 
-            return data
+            return response_data
 
-        except requests.exceptions.RequestException as e:
+        except urllib.error.URLError as e:
             logger.error(f"HTTP request failed: {e}")
             raise
         except Exception as e:
