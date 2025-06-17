@@ -30,6 +30,7 @@ class SlackNotifier:
         self.message_ts_file = f"{self.cache_dir}/message_ts_{workflow_id}.txt"
         # Each phase gets its own file to avoid conflicts
         self.phase_file_pattern = f"{self.cache_dir}/phase_{workflow_id}_*.json"
+        self.pipeline_title = "Infrastructure Deployment Pipeline"
 
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -65,18 +66,28 @@ class SlackNotifier:
         phases = []
 
         try:
+            # Debug: list all files in cache dir
+            logger.info(f"Looking for phase files in: {self.cache_dir}")
+            all_files = glob.glob(f"{self.cache_dir}/*")
+            logger.info(f"All files in cache: {all_files}")
+
             phase_files = glob.glob(f"{self.cache_dir}/phase_{self.workflow_id}_*.json")
+            logger.info(f"Found phase files: {phase_files}")
+
             for file_path in phase_files:
                 try:
                     with open(file_path, 'r') as f:
                         phase_data = json.load(f)
                         phases.append(phase_data)
+                        logger.info(f"Loaded phase: {phase_data.get('name', 'unknown')}")
                 except (IOError, OSError, json.JSONDecodeError) as e:
                     logger.warning(f"Failed to load phase file {file_path}: {e}")
                     continue
+
         except Exception as e:
             logger.warning(f"Failed to load phases: {e}")
 
+        logger.info(f"Total phases loaded: {len(phases)}")
         return phases
 
     def _save_phase(self, phase_name: str, phase_data: Dict) -> None:
@@ -95,6 +106,8 @@ class SlackNotifier:
     def _update_phases(self, phase: str, status: str, step: str,
                        color_key: str, is_final: bool = False) -> List[Dict]:
         """Update single phase data and return all phases"""
+        import time
+
         color = self.colors.get(color_key, self.colors["progress"])
 
         # Load existing phase data for this specific phase
@@ -116,18 +129,22 @@ class SlackNotifier:
                 current_phase['color'] = color
                 current_phase['is_final'] = is_final
 
-            # Always add the step
+            # Always add the step with timestamp
             if 'steps' not in current_phase:
                 current_phase['steps'] = []
             current_phase['steps'].append(step)
+            current_phase['last_updated'] = time.time()
         else:
-            # Create new phase
+            # Create new phase with start timestamp
+            current_time = time.time()
             current_phase = {
                 'name': phase,
                 'status': status,
                 'color': color,
                 'is_final': is_final,
-                'steps': [step]
+                'steps': [step],
+                'started_at': current_time,
+                'last_updated': current_time
             }
 
         # Save this phase
@@ -152,7 +169,7 @@ class SlackNotifier:
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"🚀 *Infrastructure Deployment Pipeline*\n\n"
+                            f"🚀 *{self.pipeline_title}*\n\n"
                             f"*Branch:* `{branch}` | *User:* `{username}`\n"
                             f"<{build_url}|View Pipeline>"
                         )
@@ -170,22 +187,10 @@ class SlackNotifier:
             ]
         }
 
-        # Sort phases by a predefined order for consistent display
-        phase_order = ["initialization", "validation", "infrastructure", "cleanup", "application", "destruction"]
-        sorted_phases = []
+        # Sort phases by started_at timestamp (chronological order)
+        sorted_phases = sorted(phases, key=lambda x: x.get('started_at', 0))
 
-        for phase_name in phase_order:
-            for phase in phases:
-                if phase.get('name') == phase_name:
-                    sorted_phases.append(phase)
-                    break
-
-        # Add any phases not in the predefined order
-        for phase in phases:
-            if phase.get('name') not in phase_order:
-                sorted_phases.append(phase)
-
-        # Create attachments (newest first - reverse the order)
+        # Create attachments (newest first - reverse chronological order)
         phase_attachments = []
         for phase in reversed(sorted_phases):
             steps_text = '\n'.join(f"• {step}" for step in phase.get('steps', []))
@@ -275,6 +280,8 @@ def main():
                         choices=['start', 'progress', 'success', 'failure'],
                         help='Status color')
     parser.add_argument('--final', action='store_true', help='Mark phase as final')
+    parser.add_argument('--title', default='Infrastructure Deployment Pipeline',
+                        help='Pipeline title for Slack message')
 
     args = parser.parse_args()
 
@@ -291,6 +298,7 @@ def main():
         sys.exit(1)
 
     notifier = SlackNotifier(token, channel, workflow_id)
+    notifier.pipeline_title = args.title
     notifier.update(
         phase=args.phase,
         status=args.status,
