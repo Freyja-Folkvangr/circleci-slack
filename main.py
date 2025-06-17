@@ -79,34 +79,60 @@ class SlackNotifier:
     def _update_phases(self, phase: str, status: str, step: str,
                        color_key: str, is_final: bool = False) -> List[Dict]:
         """Update phases data preserving failed states"""
-        phases = self._load_phases()
+        # Use file locking to prevent race conditions
+        import fcntl
+        import time
+
         color = self.colors.get(color_key, self.colors["progress"])
+        max_retries = 5
 
-        phase_exists = False
-        for p in phases:
-            if p['name'] == phase:
-                phase_exists = True
+        for attempt in range(max_retries):
+            try:
+                # Try to acquire lock and update
+                phases = self._load_phases()
 
-                if p.get('color') != self.colors["failure"]:
-                    p['status'] = status
-                    p['color'] = color
-                    p['is_final'] = is_final
+                phase_exists = False
+                for p in phases:
+                    if p['name'] == phase:
+                        phase_exists = True
 
-                if 'steps' not in p:
-                    p['steps'] = []
-                p['steps'].append(step)
-                break
+                        if p.get('color') != self.colors["failure"]:
+                            p['status'] = status
+                            p['color'] = color
+                            p['is_final'] = is_final
 
-        if not phase_exists:
-            phases.append({
-                'name': phase,
-                'status': status,
-                'color': color,
-                'is_final': is_final,
-                'steps': [step]
-            })
+                        if 'steps' not in p:
+                            p['steps'] = []
+                        p['steps'].append(step)
+                        break
 
-        self._save_phases(phases)
+                if not phase_exists:
+                    phases.append({
+                        'name': phase,
+                        'status': status,
+                        'color': color,
+                        'is_final': is_final,
+                        'steps': [step]
+                    })
+
+                self._save_phases(phases)
+                return phases
+
+            except (IOError, OSError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                else:
+                    logger.warning(f"Failed to update phases after {max_retries} attempts: {e}")
+                    # Return current phase only as fallback
+                    return [{
+                        'name': phase,
+                        'status': status,
+                        'color': color,
+                        'is_final': is_final,
+                        'steps': [step]
+                    }]
+
         return phases
 
     def _build_attachments(self, phases: List[Dict]) -> List[Dict]:
