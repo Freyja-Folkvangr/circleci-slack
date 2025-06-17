@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""
-CircleCI Slack Notifier - Single message updater for deployment pipelines
-"""
+
 import os
 import sys
 import json
 import argparse
 import logging
+import time
 from typing import Dict, List, Optional
 import urllib.request
 import urllib.error
-from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,20 +17,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class SlackNotifier:
-    """Manages Slack message updates for CircleCI pipelines"""
+class SlackAPIError(Exception):
+    pass
 
-    def __init__(self, token: str, channel: str, workflow_id: str):
+
+class SlackNotifier:
+
+    def __init__(self, token: str, channel: str, workflow_id: str, storage_channel_name: str):
         self.token = token
         self.channel = channel
         self.workflow_id = workflow_id
-        self.cache_dir = "/tmp/slack_cache"
-        self.message_ts_file = f"{self.cache_dir}/message_ts_{workflow_id}.txt"
-        # Each phase gets its own file to avoid conflicts
-        self.phase_file_pattern = f"{self.cache_dir}/phase_{workflow_id}_*.json"
+        self.storage_channel_name = storage_channel_name
+        self.storage_channel_id = None
         self.pipeline_title = "Infrastructure Deployment Pipeline"
-
-        os.makedirs(self.cache_dir, exist_ok=True)
 
         self.colors = {
             "start": "#2196F3",
@@ -41,103 +38,211 @@ class SlackNotifier:
             "failure": "#F44336"
         }
 
-    def _load_message_ts(self) -> Optional[str]:
-        """Load existing message timestamp"""
-        try:
-            if os.path.exists(self.message_ts_file):
-                with open(self.message_ts_file, 'r') as f:
-                    ts = f.read().strip()
-                    return ts if ts and ts != "null" else None
-        except (IOError, OSError) as e:
-            logger.warning(f"Failed to load message timestamp: {e}")
-        return None
+        self._resolve_storage_channel_id()
 
-    def _save_message_ts(self, ts: str) -> None:
-        """Save message timestamp"""
-        try:
-            with open(self.message_ts_file, 'w') as f:
-                f.write(ts)
-        except (IOError, OSError) as e:
-            logger.error(f"Failed to save message timestamp: {e}")
-
-    def _load_phases(self) -> List[Dict]:
-        """Load all existing phases from separate files"""
-        import glob
-        phases = []
+    def _resolve_storage_channel_id(self) -> None:
 
         try:
-            # Debug: list all files in cache dir
-            logger.info(f"Looking for phase files in: {self.cache_dir}")
-            all_files = glob.glob(f"{self.cache_dir}/*")
-            logger.info(f"All files in cache: {all_files}")
+            payload = {'types': 'public_channel,private_channel', 'limit': 200}
+            response = self._slack_request('conversations.list', payload)
 
-            phase_files = glob.glob(f"{self.cache_dir}/phase_{self.workflow_id}_*.json")
-            logger.info(f"Found phase files: {phase_files}")
+            for channel in response.get('channels', []):
+                if channel['name'] == self.storage_channel_name:
+                    self.storage_channel_id = channel['id']
+                    return
 
-            for file_path in phase_files:
-                try:
-                    with open(file_path, 'r') as f:
-                        phase_data = json.load(f)
-                        phases.append(phase_data)
-                        logger.info(f"Loaded phase: {phase_data.get('name', 'unknown')}")
-                except (IOError, OSError, json.JSONDecodeError) as e:
-                    logger.warning(f"Failed to load phase file {file_path}: {e}")
-                    continue
+            cursor = response.get('response_metadata', {}).get('next_cursor')
+            while cursor:
+                payload['cursor'] = cursor
+                response = self._slack_request('conversations.list', payload)
+
+                for channel in response.get('channels', []):
+                    if channel['name'] == self.storage_channel_name:
+                        self.storage_channel_id = channel['id']
+                        return
+
+                cursor = response.get('response_metadata', {}).get('next_cursor')
+
+            raise SlackAPIError(f"Channel '{self.storage_channel_name}' not found")
 
         except Exception as e:
-            logger.warning(f"Failed to load phases: {e}")
+            logger.error(f"Failed to resolve storage channel: {e}")
+            raise
 
-        logger.info(f"Total phases loaded: {len(phases)}")
-        return phases
+    def _slack_request(self, method: str, payload: Dict) -> Dict:
 
-    def _save_phase(self, phase_name: str, phase_data: Dict) -> None:
-        """Save individual phase data to separate file"""
-        phase_file = f"{self.cache_dir}/phase_{self.workflow_id}_{phase_name}.json"
+        url = f"https://slack.com/api/{method}"
+
+        if method in ['chat.postMessage', 'chat.update']:
+            data = json.dumps(payload).encode('utf-8')
+            headers = {
+                'Authorization': f'Bearer {self.token}',
+                'Content-Type': 'application/json'
+            }
+        else:
+            data = urllib.parse.urlencode(payload).encode('utf-8')
+            headers = {
+                'Authorization': f'Bearer {self.token}',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+
+        req = urllib.request.Request(url, data=data, headers=headers)
+
         try:
-            with open(phase_file, 'w') as f:
-                json.dump(phase_data, f, indent=2)
-        except (IOError, OSError) as e:
-            logger.error(f"Failed to save phase {phase_name}: {e}")
+            with urllib.request.urlopen(req, timeout=30) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
 
-    def _save_phases(self, phases: List[Dict]) -> None:
-        """Legacy method - not used anymore"""
-        pass
+            if not response_data.get('ok'):
+                error_msg = response_data.get('error', 'Unknown error')
+                raise SlackAPIError(f"Slack API error: {error_msg}")
 
-    def _update_phases(self, phase: str, status: str, step: str,
-                       color_key: str, is_final: bool = False) -> List[Dict]:
-        """Update single phase data and return all phases"""
-        import time
+            return response_data
+
+        except urllib.error.URLError as e:
+            logger.error(f"HTTP request failed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Slack API request failed: {e}")
+            raise
+
+    def _get_all_storage_messages(self) -> List[Dict]:
+
+        all_messages = []
+        try:
+            payload = {'channel': self.storage_channel_id, 'limit': 200}
+
+            while True:
+                response = self._slack_request('conversations.history', payload)
+                messages = response.get('messages', [])
+                all_messages.extend(messages)
+
+                cursor = response.get('response_metadata', {}).get('next_cursor')
+                if not cursor:
+                    break
+                payload['cursor'] = cursor
+
+        except Exception as e:
+            logger.error(f"Failed to get storage messages: {e}")
+
+        return all_messages
+
+    def _cleanup_and_find_pipeline(self) -> Optional[Dict]:
+
+        messages = self._get_all_storage_messages()
+        current_time = time.time()
+        ten_hours_ago = current_time - (10 * 60 * 60)
+
+        pipeline_msg = None
+        to_delete = []
+
+        for msg in messages:
+            try:
+                if not msg.get('bot_id'):
+                    continue
+
+                msg_time = float(msg['ts'])
+
+                if msg_time < ten_hours_ago:
+                    to_delete.append(msg['ts'])
+                    continue
+
+                data = json.loads(msg['text'])
+                msg_workflow_id = data.get('workflow_id')
+
+                if msg_workflow_id == self.workflow_id:
+                    if not pipeline_msg or msg_time > float(pipeline_msg['ts']):
+                        if pipeline_msg:
+                            to_delete.append(pipeline_msg['ts'])
+                        pipeline_msg = {
+                            'data': data,
+                            'ts': msg['ts']
+                        }
+                    else:
+                        to_delete.append(msg['ts'])
+
+            except (json.JSONDecodeError, ValueError, KeyError):
+                continue
+
+        for ts in to_delete:
+            try:
+                self._slack_request('chat.delete', {
+                    'channel': self.storage_channel_id,
+                    'ts': ts
+                })
+                logger.info(f"Deleted old/duplicate message: {ts}")
+            except Exception as e:
+                logger.warning(f"Failed to delete message {ts}: {e}")
+
+        return pipeline_msg
+
+    def _get_pipeline_data(self) -> Dict:
+
+        pipeline_msg = self._cleanup_and_find_pipeline()
+
+        if pipeline_msg:
+            data = pipeline_msg['data'].copy()
+            data['_storage_ts'] = pipeline_msg['ts']
+            logger.info(f"Found existing pipeline data with storage_ts: {pipeline_msg['ts']}")
+            return data
+
+        logger.info("No existing pipeline data found, creating new")
+        return {
+            'workflow_id': self.workflow_id,
+            'phases': [],
+            'message_ts': None,
+            'created_at': time.time(),
+            '_storage_ts': None
+        }
+
+    def _save_pipeline_data(self, data: Dict) -> None:
+
+        storage_ts = data.get('_storage_ts')
+        save_data = {k: v for k, v in data.items() if k != '_storage_ts'}
+        save_data['timestamp'] = time.time()
+
+        payload = {
+            'channel': self.storage_channel_id,
+            'text': json.dumps(save_data)
+        }
+
+        if storage_ts:
+            payload['ts'] = storage_ts
+            self._slack_request('chat.update', payload)
+            logger.info(f"Updated existing storage message: {storage_ts}")
+        else:
+            response = self._slack_request('chat.postMessage', payload)
+            new_ts = response['ts']
+            data['_storage_ts'] = new_ts
+            logger.info(f"Created new storage message: {new_ts}")
+
+    def _update_phase_data(self, data: Dict, phase: str, status: str, step: str,
+                           color_key: str, is_final: bool) -> None:
 
         color = self.colors.get(color_key, self.colors["progress"])
+        phases = data.get('phases', [])
 
-        # Load existing phase data for this specific phase
-        phase_file = f"{self.cache_dir}/phase_{self.workflow_id}_{phase}.json"
-        current_phase = None
+        phase_found = False
+        for p in phases:
+            if p['name'] == phase:
+                phase_found = True
 
-        try:
-            if os.path.exists(phase_file):
-                with open(phase_file, 'r') as f:
-                    current_phase = json.load(f)
-        except (IOError, OSError, json.JSONDecodeError) as e:
-            logger.warning(f"Failed to load existing phase {phase}: {e}")
+                if p.get('color') != self.colors["failure"]:
+                    p['status'] = status
+                    p['color'] = color
+                    p['is_final'] = is_final
 
-        # Update or create phase data
-        if current_phase:
-            # Never overwrite a failed state
-            if current_phase.get('color') != self.colors["failure"]:
-                current_phase['status'] = status
-                current_phase['color'] = color
-                current_phase['is_final'] = is_final
+                if 'steps' not in p:
+                    p['steps'] = []
 
-            # Always add the step with timestamp
-            if 'steps' not in current_phase:
-                current_phase['steps'] = []
-            current_phase['steps'].append(step)
-            current_phase['last_updated'] = time.time()
-        else:
-            # Create new phase with start timestamp
+                if step not in p['steps']:
+                    p['steps'].append(step)
+
+                p['last_updated'] = time.time()
+                break
+
+        if not phase_found:
             current_time = time.time()
-            current_phase = {
+            phases.append({
                 'name': phase,
                 'status': status,
                 'color': color,
@@ -145,16 +250,12 @@ class SlackNotifier:
                 'steps': [step],
                 'started_at': current_time,
                 'last_updated': current_time
-            }
+            })
 
-        # Save this phase
-        self._save_phase(phase, current_phase)
+        data['phases'] = phases
 
-        # Return all phases for message construction
-        return self._load_phases()
+    def _build_message_attachments(self, data: Dict) -> List[Dict]:
 
-    def _build_attachments(self, phases: List[Dict]) -> List[Dict]:
-        """Build Slack attachments from phases"""
         branch = os.environ.get('CIRCLE_BRANCH', 'unknown')
         username = os.environ.get('CIRCLE_USERNAME', 'unknown')
         build_url = os.environ.get('CIRCLE_BUILD_URL', '#')
@@ -187,10 +288,9 @@ class SlackNotifier:
             ]
         }
 
-        # Sort phases by started_at timestamp (chronological order)
+        phases = data.get('phases', [])
         sorted_phases = sorted(phases, key=lambda x: x.get('started_at', 0))
 
-        # Create attachments (newest first - reverse chronological order)
         phase_attachments = []
         for phase in reversed(sorted_phases):
             steps_text = '\n'.join(f"• {step}" for step in phase.get('steps', []))
@@ -210,60 +310,37 @@ class SlackNotifier:
 
         return [header] + phase_attachments
 
-    def _slack_request(self, method: str, payload: Dict) -> Dict:
-        """Make Slack API request using urllib"""
-        url = f"https://slack.com/api/chat.{method}"
-        data = json.dumps(payload).encode('utf-8')
-
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                'Authorization': f'Bearer {self.token}',
-                'Content-Type': 'application/json'
-            }
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                response_data = json.loads(response.read().decode('utf-8'))
-
-            if not response_data.get('ok'):
-                error_msg = response_data.get('error', 'Unknown error')
-                raise Exception(f"Slack API error: {error_msg}")
-
-            return response_data
-
-        except urllib.error.URLError as e:
-            logger.error(f"HTTP request failed: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Slack API request failed: {e}")
-            raise
-
     def update(self, phase: str, status: str, step: str,
                color: str = "progress", is_final: bool = False) -> None:
-        """Update or create Slack message"""
+
         try:
-            phases = self._update_phases(phase, status, step, color, is_final)
-            attachments = self._build_attachments(phases)
+            logger.info(f"Starting update for phase: {phase}, workflow: {self.workflow_id}")
+
+            pipeline_data = self._get_pipeline_data()
+
+            self._update_phase_data(pipeline_data, phase, status, step, color, is_final)
+
+            self._save_pipeline_data(pipeline_data)
+
+            attachments = self._build_message_attachments(pipeline_data)
 
             payload = {
                 "channel": self.channel,
                 "attachments": attachments
             }
 
-            message_ts = self._load_message_ts()
+            message_ts = pipeline_data.get('message_ts')
 
             if message_ts:
                 payload["ts"] = message_ts
-                self._slack_request("update", payload)
-                logger.info(f"Updated Slack message: {message_ts}")
+                self._slack_request("chat.update", payload)
+                logger.info(f"Updated main message: {message_ts}")
             else:
-                data = self._slack_request("postMessage", payload)
-                message_ts = data['ts']
-                self._save_message_ts(message_ts)
-                logger.info(f"Created Slack message: {message_ts}")
+                response = self._slack_request("chat.postMessage", payload)
+                message_ts = response['ts']
+                pipeline_data['message_ts'] = message_ts
+                self._save_pipeline_data(pipeline_data)
+                logger.info(f"Created main message: {message_ts}")
 
         except Exception as e:
             logger.error(f"Failed to update Slack notification: {e}")
@@ -271,7 +348,6 @@ class SlackNotifier:
 
 
 def main():
-    """Main entry point"""
     parser = argparse.ArgumentParser(description='Update Slack deployment status')
     parser.add_argument('--phase', required=True, help='Deployment phase name')
     parser.add_argument('--status', required=True, help='Status message')
@@ -287,6 +363,7 @@ def main():
 
     token = os.environ.get('SLACK_ACCESS_TOKEN')
     channel = os.environ.get('SLACK_CHANNEL', 'C090S4FDHDL')
+    storage_channel_name = os.environ.get('SLACK_STORAGE_CHANNEL')
     workflow_id = os.environ.get('CIRCLE_WORKFLOW_ID')
 
     if not token:
@@ -297,7 +374,11 @@ def main():
         logger.error("CIRCLE_WORKFLOW_ID environment variable not set")
         sys.exit(1)
 
-    notifier = SlackNotifier(token, channel, workflow_id)
+    if not storage_channel_name:
+        logger.error("SLACK_STORAGE_CHANNEL environment variable not set")
+        sys.exit(1)
+
+    notifier = SlackNotifier(token, channel, workflow_id, storage_channel_name)
     notifier.pipeline_title = args.title
     notifier.update(
         phase=args.phase,
