@@ -28,7 +28,8 @@ class SlackNotifier:
         self.workflow_id = workflow_id
         self.cache_dir = "/tmp/slack_cache"
         self.message_ts_file = f"{self.cache_dir}/message_ts_{workflow_id}.txt"
-        self.phases_file = f"{self.cache_dir}/phases_{workflow_id}.json"
+        # Each phase gets its own file to avoid conflicts
+        self.phase_file_pattern = f"{self.cache_dir}/phase_{workflow_id}_*.json"
 
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -59,81 +60,81 @@ class SlackNotifier:
             logger.error(f"Failed to save message timestamp: {e}")
 
     def _load_phases(self) -> List[Dict]:
-        """Load existing phases data"""
+        """Load all existing phases from separate files"""
+        import glob
+        phases = []
+
         try:
-            if os.path.exists(self.phases_file):
-                with open(self.phases_file, 'r') as f:
-                    return json.load(f)
-        except (IOError, OSError, json.JSONDecodeError) as e:
-            logger.warning(f"Failed to load phases data: {e}")
-        return []
+            phase_files = glob.glob(f"{self.cache_dir}/phase_{self.workflow_id}_*.json")
+            for file_path in phase_files:
+                try:
+                    with open(file_path, 'r') as f:
+                        phase_data = json.load(f)
+                        phases.append(phase_data)
+                except (IOError, OSError, json.JSONDecodeError) as e:
+                    logger.warning(f"Failed to load phase file {file_path}: {e}")
+                    continue
+        except Exception as e:
+            logger.warning(f"Failed to load phases: {e}")
+
+        return phases
+
+    def _save_phase(self, phase_name: str, phase_data: Dict) -> None:
+        """Save individual phase data to separate file"""
+        phase_file = f"{self.cache_dir}/phase_{self.workflow_id}_{phase_name}.json"
+        try:
+            with open(phase_file, 'w') as f:
+                json.dump(phase_data, f, indent=2)
+        except (IOError, OSError) as e:
+            logger.error(f"Failed to save phase {phase_name}: {e}")
 
     def _save_phases(self, phases: List[Dict]) -> None:
-        """Save phases data"""
-        try:
-            with open(self.phases_file, 'w') as f:
-                json.dump(phases, f, indent=2)
-        except (IOError, OSError) as e:
-            logger.error(f"Failed to save phases data: {e}")
+        """Legacy method - not used anymore"""
+        pass
 
     def _update_phases(self, phase: str, status: str, step: str,
                        color_key: str, is_final: bool = False) -> List[Dict]:
-        """Update phases data preserving failed states"""
-        # Use file locking to prevent race conditions
-        import fcntl
-        import time
-
+        """Update single phase data and return all phases"""
         color = self.colors.get(color_key, self.colors["progress"])
-        max_retries = 5
 
-        for attempt in range(max_retries):
-            try:
-                # Try to acquire lock and update
-                phases = self._load_phases()
+        # Load existing phase data for this specific phase
+        phase_file = f"{self.cache_dir}/phase_{self.workflow_id}_{phase}.json"
+        current_phase = None
 
-                phase_exists = False
-                for p in phases:
-                    if p['name'] == phase:
-                        phase_exists = True
+        try:
+            if os.path.exists(phase_file):
+                with open(phase_file, 'r') as f:
+                    current_phase = json.load(f)
+        except (IOError, OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Failed to load existing phase {phase}: {e}")
 
-                        if p.get('color') != self.colors["failure"]:
-                            p['status'] = status
-                            p['color'] = color
-                            p['is_final'] = is_final
+        # Update or create phase data
+        if current_phase:
+            # Never overwrite a failed state
+            if current_phase.get('color') != self.colors["failure"]:
+                current_phase['status'] = status
+                current_phase['color'] = color
+                current_phase['is_final'] = is_final
 
-                        if 'steps' not in p:
-                            p['steps'] = []
-                        p['steps'].append(step)
-                        break
+            # Always add the step
+            if 'steps' not in current_phase:
+                current_phase['steps'] = []
+            current_phase['steps'].append(step)
+        else:
+            # Create new phase
+            current_phase = {
+                'name': phase,
+                'status': status,
+                'color': color,
+                'is_final': is_final,
+                'steps': [step]
+            }
 
-                if not phase_exists:
-                    phases.append({
-                        'name': phase,
-                        'status': status,
-                        'color': color,
-                        'is_final': is_final,
-                        'steps': [step]
-                    })
+        # Save this phase
+        self._save_phase(phase, current_phase)
 
-                self._save_phases(phases)
-                return phases
-
-            except (IOError, OSError) as e:
-                if attempt < max_retries - 1:
-                    time.sleep(0.1 * (attempt + 1))
-                    continue
-                else:
-                    logger.warning(f"Failed to update phases after {max_retries} attempts: {e}")
-                    # Return current phase only as fallback
-                    return [{
-                        'name': phase,
-                        'status': status,
-                        'color': color,
-                        'is_final': is_final,
-                        'steps': [step]
-                    }]
-
-        return phases
+        # Return all phases for message construction
+        return self._load_phases()
 
     def _build_attachments(self, phases: List[Dict]) -> List[Dict]:
         """Build Slack attachments from phases"""
@@ -169,8 +170,24 @@ class SlackNotifier:
             ]
         }
 
+        # Sort phases by a predefined order for consistent display
+        phase_order = ["initialization", "validation", "infrastructure", "cleanup", "application", "destruction"]
+        sorted_phases = []
+
+        for phase_name in phase_order:
+            for phase in phases:
+                if phase.get('name') == phase_name:
+                    sorted_phases.append(phase)
+                    break
+
+        # Add any phases not in the predefined order
+        for phase in phases:
+            if phase.get('name') not in phase_order:
+                sorted_phases.append(phase)
+
+        # Create attachments (newest first - reverse the order)
         phase_attachments = []
-        for phase in reversed(phases):
+        for phase in reversed(sorted_phases):
             steps_text = '\n'.join(f"• {step}" for step in phase.get('steps', []))
             attachment = {
                 "color": phase['color'],
