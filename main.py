@@ -35,7 +35,8 @@ class SlackNotifier:
             "start": "#2196F3",
             "progress": "#FF9800",
             "success": "#4CAF50",
-            "failure": "#F44336"
+            "failure": "#F44336",
+            "skipped": "#9E9E9E"
         }
 
         self._resolve_storage_channel_id()
@@ -353,7 +354,7 @@ def main():
     parser.add_argument('--status', required=True, help='Status message')
     parser.add_argument('--step', required=True, help='Step description')
     parser.add_argument('--color', default='progress',
-                        choices=['start', 'progress', 'success', 'failure'],
+                        choices=['start', 'progress', 'success', 'failure', 'skipped'],
                         help='Status color')
     parser.add_argument('--final', action='store_true', help='Mark phase as final')
     parser.add_argument('--title', default='Infrastructure Deployment Pipeline',
