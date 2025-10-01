@@ -227,7 +227,7 @@ class SlackNotifier:
             if p['name'] == phase:
                 phase_found = True
 
-                if p.get('color') != self.colors["failure"]:
+                if p.get('color') not in (self.colors["failure"], self.colors["success"], self.colors["skipped"]):
                     p['status'] = status
                     p['color'] = color
                     p['is_final'] = is_final
