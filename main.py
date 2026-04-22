@@ -8,6 +8,7 @@ import logging
 import time
 from typing import Dict, List, Optional
 import urllib.request
+import urllib.parse
 import urllib.error
 
 logging.basicConfig(
@@ -347,18 +348,72 @@ class SlackNotifier:
             logger.error(f"Failed to update Slack notification: {e}")
             sys.exit(1)
 
+    def upload_file(self, file_path: str, title: Optional[str] = None,
+                    initial_comment: Optional[str] = None) -> None:
+        """Upload a file to the deploy channel, threaded under the pipeline message.
+
+        Uses Slack's files.upload_v2 flow (getUploadURLExternal →
+        direct POST → completeUploadExternal). Posts in-thread on the main
+        pipeline message when message_ts is already stored; otherwise posts
+        at channel root as a standalone file.
+        """
+        filename = os.path.basename(file_path)
+        length = os.path.getsize(file_path)
+
+        get_url_resp = self._slack_request(
+            'files.getUploadURLExternal',
+            {'filename': filename, 'length': length},
+        )
+        upload_url = get_url_resp['upload_url']
+        file_id = get_url_resp['file_id']
+
+        with open(file_path, 'rb') as fh:
+            payload = fh.read()
+        upload_req = urllib.request.Request(upload_url, data=payload, method='POST')
+        with urllib.request.urlopen(upload_req, timeout=120) as resp:
+            resp.read()
+        logger.info(f"Uploaded {filename} ({length} bytes) to Slack upload endpoint")
+
+        pipeline_data = self._get_pipeline_data()
+        message_ts = pipeline_data.get('message_ts')
+
+        complete_payload = {
+            'files': json.dumps([{'id': file_id, 'title': title or filename}]),
+            'channel_id': self.channel,
+        }
+        if message_ts:
+            complete_payload['thread_ts'] = message_ts
+        if initial_comment:
+            complete_payload['initial_comment'] = initial_comment
+
+        try:
+            self._slack_request('files.completeUploadExternal', complete_payload)
+            logger.info(
+                f"File {filename} attached "
+                f"{'in thread ' + message_ts if message_ts else 'at channel root'}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to complete file upload: {e}")
+            sys.exit(1)
+
 
 def main():
     parser = argparse.ArgumentParser(description='Update Slack deployment status')
-    parser.add_argument('--phase', required=True, help='Deployment phase name')
-    parser.add_argument('--status', required=True, help='Status message')
-    parser.add_argument('--step', required=True, help='Step description')
+    parser.add_argument('--phase', help='Deployment phase name')
+    parser.add_argument('--status', help='Status message')
+    parser.add_argument('--step', help='Step description')
     parser.add_argument('--color', default='progress',
                         choices=['start', 'progress', 'success', 'failure', 'skipped'],
                         help='Status color')
     parser.add_argument('--final', action='store_true', help='Mark phase as final')
     parser.add_argument('--title', default='Infrastructure Deployment Pipeline',
                         help='Pipeline title for Slack message')
+    parser.add_argument('--upload-file',
+                        help='Path to a file to attach in the pipeline thread')
+    parser.add_argument('--upload-title',
+                        help='Override title for the uploaded file (default: filename)')
+    parser.add_argument('--upload-comment',
+                        help='Initial comment posted alongside the uploaded file')
 
     args = parser.parse_args()
 
@@ -381,12 +436,24 @@ def main():
 
     notifier = SlackNotifier(token, channel, workflow_id, storage_channel_name)
     notifier.pipeline_title = args.title
+
+    if args.upload_file:
+        notifier.upload_file(
+            file_path=args.upload_file,
+            title=args.upload_title,
+            initial_comment=args.upload_comment,
+        )
+        return
+
+    if not all([args.phase, args.status, args.step]):
+        parser.error("--phase, --status, and --step are required unless --upload-file is set")
+
     notifier.update(
         phase=args.phase,
         status=args.status,
         step=args.step,
         color=args.color,
-        is_final=args.final
+        is_final=args.final,
     )
 
 
